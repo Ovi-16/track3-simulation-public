@@ -1,0 +1,11 @@
+{
+  "components": {
+    "event_queue": 2.338956,
+    "matching": 1.715234,
+    "agent_logic": 3.118607,
+    "latency": 0.623722,
+    "io": 1.27201
+  },
+  "gpu_utilization": 0.0,
+  "peak_memory_bytes": 0
+}

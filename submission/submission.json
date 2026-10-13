@@ -1,0 +1,10 @@
+{
+  "track": "simulation",
+  "interface_version": "2.0",
+  "image": {
+    "registry": "REPLACE_WITH_YOUR_REGISTRY/track3-abides-baseline",
+    "digest": "sha256:REPLACE_WITH_PUSHED_IMAGE_DIGEST",
+    "platform": "linux/amd64"
+  },
+  "notes": "Semantics-preserving ABIDES baseline. Reproduces all 65 public units bit-exact. Ships simulate + simulate-batch verbs; no VOLUME; qfbench2.interface_version=2.0. profile.json (Best Systems Diagnosis) included per-run."
+}
