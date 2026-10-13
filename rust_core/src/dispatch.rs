@@ -48,6 +48,8 @@ pub struct Sim {
     pub next_order_id: i64,
     pub pending_order_ids: Vec<i64>,
     pub trace: TraceBuilder,
+    // Global np.random stream (post-construction) for the oracle's megashock intervals.
+    pub global_rng: MT19937,
 }
 
 impl Sim {
@@ -64,6 +66,7 @@ impl Sim {
         latency: ScenarioLatencyModel,
         oracle: Oracle,
         agents: Vec<SimAgent>,
+        global_rng: MT19937,
     ) -> Self {
         let _ = (seeds, n_agents); // seeds already consumed to build oracle/agents/latency
         let kernel = Kernel::new(
@@ -83,6 +86,7 @@ impl Sim {
             next_order_id: 0,
             pending_order_ids: Vec::new(),
             trace: TraceBuilder::new(),
+            global_rng,
         }
     }
 
@@ -143,16 +147,27 @@ impl Sim {
         let t = Touch { bid, ask };
         let agent_id = self.agents[agent_idx].id;
         let intents: Vec<OrderIntent> = {
+            // ValueTrader needs an oracle observation first (observe_price: advance the
+            // fundamental via the oracle's own streams + global, then a noisy obs from the
+            // AGENT's rng if sigma_n>0). Done outside the agent borrow to avoid aliasing.
+            let value_obs: Option<i64> = if let AgentKind::Value(vt) = &self.agents[agent_idx].kind {
+                let sigma_n = vt.sigma_n;
+                let r_t = self.oracle.advance(self.kernel.current_time, &mut self.global_rng);
+                let obs = if sigma_n == 0.0 {
+                    r_t
+                } else {
+                    let n = self.agents[agent_idx].rng.normal(r_t as f64, sigma_n.sqrt());
+                    crate::latency::python_round_to_i64(n)
+                };
+                Some(obs)
+            } else {
+                None
+            };
             let agent = &mut self.agents[agent_idx];
             match &mut agent.kind {
                 AgentKind::Noise(nt) => vec![nt.act(t, &mut agent.rng)],
                 AgentKind::Market(mm) => mm.act(t),
-                AgentKind::Value(_vt) => {
-                    // ValueTrader needs an oracle observation (one normal from its own rng);
-                    // the oracle advance + observe is wired with the oracle's own stream.
-                    // Deferred: observe_price interaction — flagged for harness debug (Half-3).
-                    Vec::new()
-                }
+                AgentKind::Value(vt) => vt.act(t, value_obs.unwrap()).into_iter().collect(),
                 AgentKind::Momentum(mt) => mt.act(t).into_iter().collect(),
             }
         };
@@ -419,5 +434,5 @@ pub fn build_sim_from_scenario(v: &serde_json::Value, seed: u64) -> Result<Sim, 
     }
 
     let default_computation_delay = 50;
-    Ok(Sim::new(seeds, n_agents, mkt_open, mkt_close, stop_time, default_computation_delay, latency, oracle, agents))
+    Ok(Sim::new(seeds, n_agents, mkt_open, mkt_close, stop_time, default_computation_delay, latency, oracle, agents, global))
 }
