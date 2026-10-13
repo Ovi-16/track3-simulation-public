@@ -26,6 +26,9 @@ const LOWER_MASK: u32 = 0x7fff_ffff;
 pub struct MT19937 {
     mt: [u32; N],
     mti: usize,
+    // NumPy RandomState's cached second normal from the polar method.
+    has_gauss: bool,
+    gauss: f64,
 }
 
 impl MT19937 {
@@ -40,7 +43,7 @@ impl MT19937 {
                 .wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 30))
                 .wrapping_add(i as u32);
         }
-        Self { mt, mti: N }
+        Self { mt, mti: N, has_gauss: false, gauss: 0.0 }
     }
 
     /// NumPy init_by_array — the path `RandomState.seed(int)` takes with key=[seed].
@@ -126,6 +129,54 @@ impl MT19937 {
     pub fn randint_u32(&mut self) -> u32 {
         self.next_u32()
     }
+
+    /// NumPy rk_gauss — the legacy standard_normal (polar / Marsaglia method). It draws
+    /// pairs of uniforms until one lands in the unit disc, returns one normal and CACHES
+    /// the other. The cache (has_gauss/gauss) is part of RandomState's state, so the draw
+    /// COUNT and ordering depend on it — this must be reproduced exactly or every normal
+    /// (hence lognormal/order-size/oracle) draw drifts.
+    pub fn standard_normal(&mut self) -> f64 {
+        if self.has_gauss {
+            self.has_gauss = false;
+            return self.gauss;
+        }
+        loop {
+            let x1 = 2.0 * self.random_sample() - 1.0;
+            let x2 = 2.0 * self.random_sample() - 1.0;
+            let r2 = x1 * x1 + x2 * x2;
+            if r2 < 1.0 && r2 != 0.0 {
+                let f = (-2.0 * r2.ln() / r2).sqrt();
+                self.gauss = f * x1; // cached for next call
+                self.has_gauss = true;
+                return f * x2;
+            }
+        }
+    }
+
+    /// NumPy normal(loc, scale) = loc + scale * standard_normal().
+    pub fn normal(&mut self, loc: f64, scale: f64) -> f64 {
+        loc + scale * self.standard_normal()
+    }
+
+    /// NumPy lognormal(mean, sigma) = exp(normal(mean, sigma)) = exp(mean + sigma*gauss).
+    pub fn lognormal(&mut self, mean: f64, sigma: f64) -> f64 {
+        (mean + sigma * self.standard_normal()).exp()
+    }
+
+    /// NumPy uniform(low, high) = low + (high-low) * random_sample().
+    pub fn uniform(&mut self, low: f64, high: f64) -> f64 {
+        low + (high - low) * self.random_sample()
+    }
+
+    /// NumPy standard_exponential = -ln(1 - random_sample())  (rk_standard_exponential).
+    pub fn standard_exponential(&mut self) -> f64 {
+        -(1.0 - self.random_sample()).ln()
+    }
+
+    /// NumPy pareto(a) = exp(standard_exponential() / a) - 1  (rk_pareto).
+    pub fn pareto(&mut self, a: f64) -> f64 {
+        (self.standard_exponential() / a).exp() - 1.0
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +206,49 @@ mod tests {
             let got = r.random_sample();
             assert!((got - e).abs() < 1e-15, "sample {i}: got {got} != numpy {e}");
         }
+    }
+
+    fn approx(got: f64, e: f64, i: usize, name: &str) {
+        assert!((got - e).abs() < 1e-12, "{name} {i}: got {got} != numpy {e}");
+    }
+
+    // RandomState(0).standard_normal() x3 -> [1.764052..., 0.400157..., 0.978738...]
+    #[test]
+    fn standard_normal_matches_numpy_seed0() {
+        let mut r = MT19937::new(0);
+        let e = [1.764052345967664, 0.4001572083672233, 0.9787379841057392];
+        for (i, &v) in e.iter().enumerate() { approx(r.standard_normal(), v, i, "normal"); }
+    }
+
+    // RandomState(0).lognormal(0,1) x3 -> [5.836039..., 1.492059..., 2.661096...]
+    #[test]
+    fn lognormal_matches_numpy_seed0() {
+        let mut r = MT19937::new(0);
+        let e = [5.836039190663969, 1.4920592434019648, 2.661095776728801];
+        for (i, &v) in e.iter().enumerate() { approx(r.lognormal(0.0, 1.0), v, i, "lognormal"); }
+    }
+
+    // RandomState(7).uniform(10,20) x3
+    #[test]
+    fn uniform_matches_numpy_seed7() {
+        let mut r = MT19937::new(7);
+        let e = [10.763082893739572, 17.799187922401146, 14.384092314408935];
+        for (i, &v) in e.iter().enumerate() { approx(r.uniform(10.0, 20.0), v, i, "uniform"); }
+    }
+
+    // RandomState(3).pareto(1.5) x3
+    #[test]
+    fn pareto_matches_numpy_seed3() {
+        let mut r = MT19937::new(3);
+        let e = [0.7049258009003234, 1.2727833622612068, 0.2575645258277608];
+        for (i, &v) in e.iter().enumerate() { approx(r.pareto(1.5), v, i, "pareto"); }
+    }
+
+    // RandomState(5).normal(100,5) x3
+    #[test]
+    fn normal_loc_scale_matches_numpy_seed5() {
+        let mut r = MT19937::new(5);
+        let e = [102.2061374344252, 98.34564924052957, 112.1538559350389];
+        for (i, &v) in e.iter().enumerate() { approx(r.normal(100.0, 5.0), v, i, "normal_ls"); }
     }
 }
