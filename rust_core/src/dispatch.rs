@@ -236,10 +236,16 @@ impl Sim {
         };
         let result = self.book.handle_limit_order(incoming);
         for fill in &result.fills {
-            // All fills emitted as ORDER_EXECUTED (fill price); FILLED/PARTIAL resolved later.
+            // Aggressor's execution row (ORDER_FILLED placeholder; finalize resolves FILLED/PARTIAL).
             self.trace.push(TraceRow {
-                t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_FILLED, // placeholder, finalized in post-pass
+                t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_FILLED,
                 side: tside, price: fill.fill_price, size: fill.quantity, order_id,
+            });
+            // RESTING order's execution row — ABIDES emits ORDER_EXECUTED for BOTH trade sides.
+            let rside = match fill.resting_side { Side::Bid => TraceSide::Bid, Side::Ask => TraceSide::Ask };
+            self.trace.push(TraceRow {
+                t_ns, agent_id: fill.resting_agent_id as i32, msg_type: msg_type::ORDER_FILLED,
+                side: rside, price: fill.fill_price, size: fill.quantity, order_id: fill.resting_order_id,
             });
             self.kernel.send_message(self.exchange_id, fill.resting_agent_id,
                 MsgKind::OrderExecuted { order_id: fill.resting_order_id, qty: fill.quantity, price: fill.fill_price }, 0);

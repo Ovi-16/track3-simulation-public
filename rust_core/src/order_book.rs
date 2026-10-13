@@ -44,6 +44,8 @@ pub struct Fill {
     /// the resting (passive) order consumed
     pub resting_order_id: i64,
     pub resting_agent_id: i64,
+    /// the resting order's side (opposite of the incoming aggressor)
+    pub resting_side: Side,
     /// the incoming (aggressive) order
     pub incoming_order_id: i64,
     pub incoming_agent_id: i64,
@@ -121,6 +123,7 @@ impl OrderBook {
             fill_price,
             resting_order_id: roid,
             resting_agent_id: raid,
+            resting_side: match order.side { Side::Bid => Side::Ask, Side::Ask => Side::Bid },
             incoming_order_id: order.order_id,
             incoming_agent_id: order.agent_id,
         })
