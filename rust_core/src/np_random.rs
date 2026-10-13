@@ -177,6 +177,36 @@ impl MT19937 {
     pub fn pareto(&mut self, a: f64) -> f64 {
         (self.standard_exponential() / a).exp() - 1.0
     }
+
+    /// NumPy exponential(scale) = scale * standard_exponential().
+    pub fn exponential(&mut self, scale: f64) -> f64 {
+        scale * self.standard_exponential()
+    }
+
+    /// NumPy legacy `randint(0, high)` (rk_random_uint32 / masked rejection). NumPy
+    /// builds a mask = smallest (2^k - 1) >= (high-1), draws masked 32-bit words and
+    /// rejects any >= high. For high=2 this is `next_u32() & 1`. Verified vs numpy
+    /// 1.26.4 randint(2) seed0 -> [0,1,1,0,1,...].
+    pub fn randint_below(&mut self, high: u32) -> u32 {
+        debug_assert!(high > 0);
+        let rng_range = high - 1; // max inclusive value
+        if rng_range == 0 {
+            return 0;
+        }
+        // mask = smallest 2^k - 1 >= rng_range
+        let mut mask = rng_range;
+        mask |= mask >> 1;
+        mask |= mask >> 2;
+        mask |= mask >> 4;
+        mask |= mask >> 8;
+        mask |= mask >> 16;
+        loop {
+            let v = self.next_u32() & mask;
+            if v <= rng_range {
+                return v;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +280,23 @@ mod tests {
         let mut r = MT19937::new(5);
         let e = [102.2061374344252, 98.34564924052957, 112.1538559350389];
         for (i, &v) in e.iter().enumerate() { approx(r.normal(100.0, 5.0), v, i, "normal_ls"); }
+    }
+
+    // RandomState(0).exponential(2.0) x3
+    #[test]
+    fn exponential_matches_numpy_seed0() {
+        let mut r = MT19937::new(0);
+        let e = [1.59174901632622, 2.5118615259316757, 1.8464462916081377];
+        for (i, &v) in e.iter().enumerate() { approx(r.exponential(2.0), v, i, "exponential"); }
+    }
+
+    // RandomState(0).randint(2) x10 -> [0,1,1,0,1,1,1,1,1,1]
+    #[test]
+    fn randint_below_2_matches_numpy_seed0() {
+        let mut r = MT19937::new(0);
+        let e = [0u32, 1, 1, 0, 1, 1, 1, 1, 1, 1];
+        for (i, &v) in e.iter().enumerate() {
+            assert_eq!(r.randint_below(2), v, "randint(2) {i}");
+        }
     }
 }

@@ -7,6 +7,7 @@
 
 mod latency;
 mod np_random;
+mod oracle;
 mod order_book;
 mod price_level;
 
