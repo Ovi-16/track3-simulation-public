@@ -5,6 +5,7 @@
 //! event queue follows. This lib.rs currently exposes the building blocks and a
 //! self-check; the OrderBook pyclass is added as price_level/order_book stabilize.
 
+mod agents;
 mod latency;
 mod np_random;
 mod oracle;
