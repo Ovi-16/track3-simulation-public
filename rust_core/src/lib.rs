@@ -13,6 +13,7 @@ mod np_random;
 mod oracle;
 mod order_book;
 mod price_level;
+mod trace;
 
 use pyo3::prelude::*;
 
