@@ -88,6 +88,72 @@ impl TraceBuilder {
     pub fn is_empty(&self) -> bool {
         self.t_ns.is_empty()
     }
+
+    /// Post-pass matching extract_trace (trace.py) before serialization:
+    ///  1. FILLED/PARTIAL: every fill was emitted as ORDER_FILLED (placeholder); the
+    ///     FINAL fill per order_id stays ORDER_FILLED, earlier ones become PARTIAL_FILL
+    ///     (extract_trace: last ORDER_EXECUTED per order_id = FILLED).
+    ///  2. QUOTE_UPDATE dedup: keep only the LAST quote per (t_ns, side).
+    ///  3. stable sort by (t_ns, order_id).
+    /// Operates on a row view since columns are parallel vectors.
+    pub fn finalize(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        // Rebuild as rows for the transforms, then re-split (clarity over micro-perf;
+        // the hot path is the sim, not this once-per-run pass).
+        #[derive(Clone)]
+        struct R { t: i64, a: i32, m: &'static str, s: &'static str, p: i64, sz: i64, oid: i64 }
+        let mut rows: Vec<R> = (0..n).map(|i| R {
+            t: self.t_ns[i], a: self.agent_id[i], m: self.msg_type[i], s: self.side[i],
+            p: self.price[i], sz: self.size[i], oid: self.order_id[i],
+        }).collect();
+
+        // 1. FILLED/PARTIAL: find the LAST ORDER_FILLED index per order_id; others -> PARTIAL.
+        use std::collections::HashMap;
+        let mut last_fill: HashMap<i64, usize> = HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            if r.m == msg_type::ORDER_FILLED {
+                last_fill.insert(r.oid, i);
+            }
+        }
+        for (i, r) in rows.iter_mut().enumerate() {
+            if r.m == msg_type::ORDER_FILLED {
+                if last_fill.get(&r.oid) != Some(&i) {
+                    r.m = msg_type::PARTIAL_FILL;
+                }
+            }
+        }
+
+        // 2. QUOTE_UPDATE dedup: keep LAST per (t_ns, side). Mark earlier quote dupes for drop.
+        let mut last_quote: HashMap<(i64, &'static str), usize> = HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            if r.m == msg_type::QUOTE_UPDATE {
+                last_quote.insert((r.t, r.s), i);
+            }
+        }
+        let mut kept: Vec<R> = Vec::with_capacity(rows.len());
+        for (i, r) in rows.into_iter().enumerate() {
+            if r.m == msg_type::QUOTE_UPDATE
+                && last_quote.get(&(r.t, r.s)) != Some(&i)
+            {
+                continue; // superseded quote at same (t_ns, side)
+            }
+            kept.push(r);
+        }
+
+        // 3. stable sort by (t_ns, order_id).
+        kept.sort_by(|x, y| x.t.cmp(&y.t).then_with(|| x.oid.cmp(&y.oid)));
+
+        // re-split into columns
+        self.t_ns.clear(); self.agent_id.clear(); self.msg_type.clear();
+        self.side.clear(); self.price.clear(); self.size.clear(); self.order_id.clear();
+        for r in kept {
+            self.t_ns.push(r.t); self.agent_id.push(r.a); self.msg_type.push(r.m);
+            self.side.push(r.s); self.price.push(r.p); self.size.push(r.sz); self.order_id.push(r.oid);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +176,31 @@ mod tests {
         assert_eq!(b.msg_type, vec!["ORDER_FILLED", "QUOTE_UPDATE"]);
         assert_eq!(b.side, vec!["BID", ""]);
         assert_eq!(b.order_id, vec![42, 0]);
+    }
+
+    #[test]
+    fn finalize_resolves_fills_dedups_quotes_and_sorts() {
+        let mut b = TraceBuilder::new();
+        // two fills on order 7 (first PARTIAL, last FILLED) at t=100 and t=100
+        b.push(TraceRow { t_ns: 100, agent_id: 1, msg_type: msg_type::ORDER_FILLED,
+            side: TraceSide::Bid, price: 99, size: 3, order_id: 7 });
+        b.push(TraceRow { t_ns: 100, agent_id: 1, msg_type: msg_type::ORDER_FILLED,
+            side: TraceSide::Bid, price: 99, size: 2, order_id: 7 });
+        // two quotes same (t,side) — keep last
+        b.push(TraceRow { t_ns: 100, agent_id: 0, msg_type: msg_type::QUOTE_UPDATE,
+            side: TraceSide::Bid, price: 98, size: 10, order_id: -1 });
+        b.push(TraceRow { t_ns: 100, agent_id: 0, msg_type: msg_type::QUOTE_UPDATE,
+            side: TraceSide::Bid, price: 97, size: 5, order_id: -1 });
+        b.finalize();
+        // order_id -1 sorts before 7; one quote (last, price 97) survives
+        let quotes: Vec<_> = (0..b.len()).filter(|&i| b.msg_type[i] == "QUOTE_UPDATE").collect();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(b.price[quotes[0]], 97);
+        // fills: first FILLED became PARTIAL_FILL, last stays ORDER_FILLED
+        let fills: Vec<_> = (0..b.len())
+            .filter(|&i| b.msg_type[i] == "PARTIAL_FILL" || b.msg_type[i] == "ORDER_FILLED").collect();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(b.msg_type[fills[0]], "PARTIAL_FILL");
+        assert_eq!(b.msg_type[fills[1]], "ORDER_FILLED");
     }
 }
