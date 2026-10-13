@@ -41,3 +41,6 @@ regression_suite/gen_status.jsonl
 
 # organizer regeneration cache — units/ ships the self-contained reference copy
 regression_suite/reference_traces/
+
+# Local scoring venv (Phase 1)
+.venv-scoring/

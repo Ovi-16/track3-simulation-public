@@ -1,1 +1,20 @@
 *.parquet filter=lfs diff=lfs merge=lfs -text
+
+# Agenthon Track 3 fork — force LF on all text so a Windows checkout does not
+# produce CRLF that breaks `git apply` and shebang `exec` inside the Linux build
+# container. Added after CRLF corruption broke the baseline Docker build.
+* text=auto eol=lf
+
+# Shell shims and patches MUST be LF (CRLF shebang => "no such file or directory").
+*.sh    text eol=lf
+*.patch text eol=lf
+*.py    text eol=lf
+Dockerfile text eol=lf
+simulate       text eol=lf
+simulate-batch text eol=lf
+
+# Binary — never touch.
+*.parquet binary
+*.png binary
+*.jpg binary
+*.gz  binary
