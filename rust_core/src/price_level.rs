@@ -60,6 +60,18 @@ impl PriceLevel {
         self.orders.first()
     }
 
+    /// Remove a resting order by id (a cancel), updating the maintained total.
+    /// Returns (price, remaining_qty) of the removed order, or None if not present.
+    pub fn remove_by_id(&mut self, order_id: i64) -> Option<(i64, i64)> {
+        if let Some(pos) = self.orders.iter().position(|o| o.order_id == order_id) {
+            let o = self.orders.remove(pos);
+            self.total -= o.quantity;
+            Some((o.price, o.quantity))
+        } else {
+            None
+        }
+    }
+
     /// Fill up to `want` shares against the oldest resting order, piecewise — the
     /// semantics of one `execute_order` step at this level. Returns the matched
     /// (quantity, price, resting_order_id, resting_agent_id) or None if empty.

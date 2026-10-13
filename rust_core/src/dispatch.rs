@@ -33,6 +33,9 @@ pub struct SimAgent {
     pub interval_ns: i64,
     pub mkt_open: i64,
     pub mkt_close: i64,
+    /// Live resting order_ids this agent has on the book (insertion order == ascending
+    /// id). Used by MarketMaker.cancel_all_orders (ABIDES iterates self.orders.values()).
+    pub resting_ids: Vec<i64>,
 }
 
 /// The full simulation state the dispatch drives. Half 1 holds the pieces + the
@@ -146,6 +149,23 @@ impl Sim {
     pub fn on_spread_response(&mut self, agent_idx: usize, bid: i64, ask: i64) {
         let t = Touch { bid, ask };
         let agent_id = self.agents[agent_idx].id;
+        // MarketMaker.cancel_all_orders(): before reposting, cancel every resting order
+        // this agent holds, in insertion order (== ascending id, ABIDES self.orders.values()).
+        if matches!(self.agents[agent_idx].kind, AgentKind::Market(_)) {
+            let ids: Vec<i64> = self.agents[agent_idx].resting_ids.clone();
+            let t_ns = self.kernel.current_time;
+            for oid in ids {
+                if let Some((side, price, qty)) = self.book.cancel_order(oid) {
+                    let tside = match side { Side::Bid => TraceSide::Bid, Side::Ask => TraceSide::Ask };
+                    self.trace.push(TraceRow {
+                        t_ns, agent_id: agent_id as i32, msg_type: msg_type::ORDER_CANCELLED,
+                        side: tside, price, size: qty, order_id: oid,
+                    });
+                    self.kernel.send_message(self.exchange_id, agent_id, MsgKind::OrderCancelled { order_id: oid }, 0);
+                }
+            }
+            self.agents[agent_idx].resting_ids.clear();
+        }
         let intents: Vec<OrderIntent> = {
             // ValueTrader needs an oracle observation first (observe_price: advance the
             // fundamental via the oracle's own streams + global, then a noisy obs from the
@@ -232,6 +252,10 @@ impl Sim {
                 side: tside, price, size, order_id,
             });
             self.kernel.send_message(self.exchange_id, submitter_id, MsgKind::OrderAccepted { order_id }, 0);
+            // Track the resting order on its agent (ids 1..N -> idx id-1) so cancel_all finds it.
+            if submitter_id >= 1 && (submitter_id as usize - 1) < self.agents.len() {
+                self.agents[submitter_id as usize - 1].resting_ids.push(order_id);
+            }
         }
         // QUOTE_UPDATE: best BID + best ASK after the change (BEST_BID/BEST_ASK -> QUOTE_UPDATE,
         // order_id = -1). Post-pass dedups to final per (t_ns, side).
@@ -428,7 +452,7 @@ pub fn build_sim_from_scenario(v: &serde_json::Value, seed: u64) -> Result<Sim, 
                 }),
                 other => return Err(format!("unsupported agent_type: {other}")),
             };
-            agents.push(SimAgent { id: next_id, kind, rng, interval_ns: interval_ns.max(1), mkt_open, mkt_close });
+            agents.push(SimAgent { id: next_id, kind, rng, interval_ns: interval_ns.max(1), mkt_open, mkt_close, resting_ids: Vec::new() });
             next_id += 1;
         }
     }

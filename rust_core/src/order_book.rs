@@ -157,6 +157,25 @@ impl OrderBook {
         book.insert(pos, lvl);
     }
 
+    /// Cancel a resting order by id. Scans bids then asks, removes the order from its
+    /// level (dropping the level if it empties), returns (side, price, remaining_qty)
+    /// for the ORDER_CANCELLED trace row. None if not found.
+    pub fn cancel_order(&mut self, order_id: i64) -> Option<(Side, i64, i64)> {
+        for li in 0..self.bids.len() {
+            if let Some((price, qty)) = self.bids[li].remove_by_id(order_id) {
+                if self.bids[li].is_empty() { self.bids.remove(li); }
+                return Some((Side::Bid, price, qty));
+            }
+        }
+        for li in 0..self.asks.len() {
+            if let Some((price, qty)) = self.asks[li].remove_by_id(order_id) {
+                if self.asks[li].is_empty() { self.asks.remove(li); }
+                return Some((Side::Ask, price, qty));
+            }
+        }
+        None
+    }
+
     /// Full handle_limit_order: loop execute_once consuming the best price first,
     /// then rest the remainder. Returns ordered fills + last-trade average.
     pub fn handle_limit_order(&mut self, mut order: IncomingOrder) -> HandleResult {
