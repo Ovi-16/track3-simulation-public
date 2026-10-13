@@ -83,3 +83,35 @@ diagnosis narrative tells (bottleneck moves pure-Python → compiled → GPU).
   long-horizon) to confirm the ranking generalizes before committing Phase 2 order.
 - Add real NVTX ranges (nsys) once the compiled core exists, so the SimProfile is
   measured on the optimized build, not just the baseline.
+
+## Multi-unit confirmation (ranking generalizes — and sharpens with scale)
+
+Profiled four contrasting shapes. The hot-loop share is stable-to-rising with size:
+
+| unit | events | hot loop | % of window |
+|---|---|---|---|
+| t3-as01-base-mix | 24,695 | 4.37s | 86.7% |
+| t3-as02-scale-up-noise | 42,231 | 7.01s | 86.9% |
+| t3-as03-mm-liquidity-heavy | 50,828 | 8.51s | 87.9% |
+| **t3-mr-deep-book-state-size** | **319,488** | **55.28s** | **90.9%** |
+
+**The big unit changes the priority order.** On `mr-deep-book-state-size` (6× larger,
+the kind of unit that dominates the mean-throughput ranking) the top self-costs are:
+
+| rank | hotspot | self time | calls | note |
+|---|---|---|---|---|
+| 1 | `kernel.runner` (event loop) | 2.79s | 1 | the DES spine |
+| — | `queue.get`+`put`+`_heapq.heappop` | **4.54s** | 980,960 ×3 | **the O(log n) heap — now the dominant cost** |
+| 2 | `fmt_ts` | 2.78s | 520,015 | timestamp formatting (pure waste) |
+| 3 | `isinstance` | 1.70s | **10,728,862** | dynamic dispatch, explodes with scale |
+| 4 | `deepcopy` | 1.47s | 731,182 | per-message object copy |
+| 5 | `price_level` genexpr + `sum` | 2.24s | 6.5M + 2.1M | `total_quantity` depth-recompute (hotspot #8) |
+
+**Revised Phase-2 insight:** at the large units that decide the ranked mean, the
+**event-queue heap (`queue`+`heappop` ≈ 4.5s)** and the **depth-recompute
+(`total_quantity` ≈ 2.2s)** grow superlinearly — the calendar/ladder queue (§5.4)
+and an O(1) maintained depth total are not constant-factor wins there, they change
+the complexity class. `fmt_ts` + `isinstance` (~4.5s combined) is pure tax a typed
+compiled core deletes. This reinforces the attack order but raises the **event
+queue** to co-priority with the order book for Phase 2a, because its cost is where
+the big units bleed.
