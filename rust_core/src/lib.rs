@@ -6,6 +6,7 @@
 //! self-check; the OrderBook pyclass is added as price_level/order_book stabilize.
 
 mod agents;
+mod engine;
 mod kernel;
 mod latency;
 mod np_random;
@@ -34,5 +35,6 @@ fn self_check() -> PyResult<String> {
 #[pymodule]
 fn track3_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(self_check, m)?)?;
+    m.add_class::<engine::Engine>()?;
     Ok(())
 }
