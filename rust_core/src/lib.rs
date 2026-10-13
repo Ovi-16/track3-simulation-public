@@ -6,6 +6,7 @@
 //! self-check; the OrderBook pyclass is added as price_level/order_book stabilize.
 
 mod agents;
+mod kernel;
 mod latency;
 mod np_random;
 mod oracle;
