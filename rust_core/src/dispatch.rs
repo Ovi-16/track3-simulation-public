@@ -173,18 +173,27 @@ impl Sim {
         }
     }
 
-    /// Exchange handling of OrderSubmit: run the matching engine, emit trace rows for
-    /// each fill (ORDER_FILLED/PARTIAL_FILL) and the resting remainder (ORDER_ACCEPTED),
-    /// plus a QUOTE_UPDATE on book change. Notifications go back to the agents.
+    /// Exchange handling of OrderSubmit. Trace semantics match extract_trace (trace.py):
+    ///   * ORDER_SUBMITTED row carries the order's LIMIT price (emitted agent-side in
+    ///     ABIDES; here at submit time).
+    ///   * each fill is an ORDER_EXECUTED event; the FINAL execution per order_id becomes
+    ///     ORDER_FILLED and earlier ones PARTIAL_FILL. Because that split is GLOBAL per
+    ///     order_id (last occurrence in (t_ns) order), we emit all fills as ORDER_EXECUTED
+    ///     with the fill price and RESOLVE the FILLED/PARTIAL label in a post-pass over the
+    ///     whole trace (finalize_trace), exactly like extract_trace's drop_duplicates(keep=last).
+    ///   * ORDER_ACCEPTED on a rested remainder (limit price).
+    ///   * QUOTE_UPDATE comes from BEST_BID/BEST_ASK: after the book changes, emit the best
+    ///     BID and best ASK (order_id = -1, price/size from the level). A post-pass dedups to
+    ///     the final quote per (t_ns, side), like extract_trace.
     pub fn on_order_submit(&mut self, submitter_id: i64, side_is_bid: bool, size: i64, price: i64) {
         let order_id = self.pending_order_ids.remove(0);
         let t_ns = self.kernel.current_time;
         let side = if side_is_bid { Side::Bid } else { Side::Ask };
-        // ORDER_SUBMITTED trace row
+        let tside = if side_is_bid { TraceSide::Bid } else { TraceSide::Ask };
+        // ORDER_SUBMITTED (limit price)
         self.trace.push(TraceRow {
             t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_SUBMITTED,
-            side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
-            price, size, order_id,
+            side: tside, price, size, order_id,
         });
         let incoming = IncomingOrder {
             order_id, agent_id: submitter_id, side, quantity: size,
@@ -192,13 +201,11 @@ impl Sim {
         };
         let result = self.book.handle_limit_order(incoming);
         for fill in &result.fills {
-            let mt = if fill.quantity == size { msg_type::ORDER_FILLED } else { msg_type::PARTIAL_FILL };
+            // All fills emitted as ORDER_EXECUTED (fill price); FILLED/PARTIAL resolved later.
             self.trace.push(TraceRow {
-                t_ns, agent_id: submitter_id as i32, msg_type: mt,
-                side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
-                price: fill.fill_price, size: fill.quantity, order_id,
+                t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_FILLED, // placeholder, finalized in post-pass
+                side: tside, price: fill.fill_price, size: fill.quantity, order_id,
             });
-            // notify both parties (OrderExecuted)
             self.kernel.send_message(self.exchange_id, fill.resting_agent_id,
                 MsgKind::OrderExecuted { order_id: fill.resting_order_id, qty: fill.quantity, price: fill.fill_price }, 0);
             self.kernel.send_message(self.exchange_id, submitter_id,
@@ -207,17 +214,20 @@ impl Sim {
         if result.accepted_remainder {
             self.trace.push(TraceRow {
                 t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_ACCEPTED,
-                side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
-                price, size, order_id,
+                side: tside, price, size, order_id,
             });
             self.kernel.send_message(self.exchange_id, submitter_id, MsgKind::OrderAccepted { order_id }, 0);
         }
-        // QUOTE_UPDATE on book change
-        let t = self.touch();
-        self.trace.push(TraceRow {
-            t_ns, agent_id: self.exchange_id as i32, msg_type: msg_type::QUOTE_UPDATE,
-            side: TraceSide::None, price: t.bid, size: 0, order_id: 0,
-        });
+        // QUOTE_UPDATE: best BID + best ASK after the change (BEST_BID/BEST_ASK -> QUOTE_UPDATE,
+        // order_id = -1). Post-pass dedups to final per (t_ns, side).
+        if let Some((bp, bq)) = self.book.best_bid() {
+            self.trace.push(TraceRow { t_ns, agent_id: self.exchange_id as i32,
+                msg_type: msg_type::QUOTE_UPDATE, side: TraceSide::Bid, price: bp, size: bq, order_id: -1 });
+        }
+        if let Some((ap, aq)) = self.book.best_ask() {
+            self.trace.push(TraceRow { t_ns, agent_id: self.exchange_id as i32,
+                msg_type: msg_type::QUOTE_UPDATE, side: TraceSide::Ask, price: ap, size: aq, order_id: -1 });
+        }
     }
 
     /// Drive the event loop to completion, dispatching each event by kind.
