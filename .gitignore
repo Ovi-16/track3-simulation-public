@@ -44,3 +44,6 @@ regression_suite/reference_traces/
 
 # Local scoring venv (Phase 1)
 .venv-scoring/
+# Rust build artifacts
+rust_core/target/
+Cargo.lock

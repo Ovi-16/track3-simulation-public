@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "track3-core"
+version = "0.1.0"
+description = "SPEC-01 Phase 2 — semantics-preserving compiled core for Track 3 ABIDES."
+requires-python = ">=3.11"
+
+[tool.maturin]
+# Build the cdylib as the `track3_core` Python module.
+module-name = "track3_core"
