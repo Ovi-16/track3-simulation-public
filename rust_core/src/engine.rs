@@ -53,13 +53,53 @@ impl Engine {
     /// run(scenario_json, seed) -> dict of trace columns + message_trace columns.
     /// STUB until the L4 dispatch + L5 trace are wired and bit-exact vs the reference.
     #[pyo3(signature = (scenario_json, seed))]
-    fn run(&self, scenario_json: &str, seed: u64) -> PyResult<String> {
-        let _ = (scenario_json, seed);
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "track3_core Engine.run: dispatch/trace wiring in progress (SPEC-04); \
-             use the Python baseline engine until equivalence_harness.py is bit-exact",
-        ))
+    fn run(&self, scenario_json: &str, seed: u64) -> PyResult<TraceColumns> {
+        run_sim(scenario_json, seed)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
+}
+
+/// The 7 trace columns returned to Python, assembled into a pyarrow Table on the
+/// Python side (simulate.py). Parallel vectors == TraceBuilder columns post-finalize.
+#[pyclass]
+pub struct TraceColumns {
+    #[pyo3(get)]
+    pub t_ns: Vec<i64>,
+    #[pyo3(get)]
+    pub agent_id: Vec<i32>,
+    #[pyo3(get)]
+    pub msg_type: Vec<String>,
+    #[pyo3(get)]
+    pub side: Vec<String>,
+    #[pyo3(get)]
+    pub price: Vec<i64>,
+    #[pyo3(get)]
+    pub size: Vec<i64>,
+    #[pyo3(get)]
+    pub order_id: Vec<i64>,
+}
+
+/// Parse the scenario, build the sim with config-order seeds, run, finalize, return
+/// columns. serde_json::Value keeps this resilient to scenario schema variance; only
+/// the fields the baseline consumes are read (SPEC-04). Returns Err(string) on a parse
+/// problem so Engine.run surfaces a clean Python exception rather than panicking.
+fn run_sim(scenario_json: &str, seed: u64) -> Result<TraceColumns, String> {
+    use crate::dispatch::{build_sim_from_scenario};
+    let v: serde_json::Value =
+        serde_json::from_str(scenario_json).map_err(|e| format!("scenario JSON parse: {e}"))?;
+    let mut sim = build_sim_from_scenario(&v, seed)?;
+    sim.run_to_completion();
+    sim.trace.finalize();
+    let tb = &sim.trace;
+    Ok(TraceColumns {
+        t_ns: tb.t_ns.clone(),
+        agent_id: tb.agent_id.clone(),
+        msg_type: tb.msg_type.iter().map(|s| s.to_string()).collect(),
+        side: tb.side.iter().map(|s| s.to_string()).collect(),
+        price: tb.price.clone(),
+        size: tb.size.clone(),
+        order_id: tb.order_id.clone(),
+    })
 }
 
 #[cfg(test)]

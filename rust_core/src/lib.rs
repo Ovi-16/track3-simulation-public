@@ -38,5 +38,6 @@ fn self_check() -> PyResult<String> {
 fn track3_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(self_check, m)?)?;
     m.add_class::<engine::Engine>()?;
+    m.add_class::<engine::TraceColumns>()?;
     Ok(())
 }

@@ -264,3 +264,160 @@ mod tests {
     // in isolation it has no bit-exact oracle. Compilation + the component-seed test
     // (engine.rs) are the Half-1 gates.
 }
+
+
+
+// ---- Scenario -> Sim construction (config.py equivalent, SPEC-04) ----
+
+use crate::engine::draw_component_seeds;
+use crate::latency::LatencyKind;
+use crate::oracle::{ScheduledJump, SymbolParams};
+
+fn jget_f64(v: &serde_json::Value, path: &[&str], default: f64) -> f64 {
+    let mut cur = v;
+    for k in path {
+        match cur.get(k) { Some(n) => cur = n, None => return default }
+    }
+    cur.as_f64().unwrap_or(default)
+}
+fn jget_i64(v: &serde_json::Value, path: &[&str], default: i64) -> i64 {
+    let mut cur = v;
+    for k in path {
+        match cur.get(k) { Some(n) => cur = n, None => return default }
+    }
+    cur.as_i64().unwrap_or(default)
+}
+
+const DATE_NS: i64 = 1_612_483_200_000_000_000; // 2021-02-05 00:00:00 UTC (pd.to_datetime("20210205"))
+const MKT_OPEN_OFFSET: i64 = 34_200_000_000_000; // 09:30:00 in ns
+const STARTING_CASH: i64 = 10_000_000;
+
+/// Build the Sim from a scenario Value + seed, mirroring config.py's construction and
+/// its exact RNG draw order (global seed -> per-component randint_u32). NOTE: this is
+/// the first wiring; bit-exactness is pursued against equivalence_harness.py. Several
+/// fields (oracle kappa/megashock conversions) follow config.py's documented mappings.
+pub fn build_sim_from_scenario(v: &serde_json::Value, seed: u64) -> Result<Sim, String> {
+    // count agents
+    let agent_cfgs = v.get("agent_configs").and_then(|a| a.as_array())
+        .ok_or("scenario missing agent_configs array")?;
+    let n_agents: usize = agent_cfgs.iter()
+        .map(|c| c.get("count").and_then(|n| n.as_i64()).unwrap_or(1) as usize).sum();
+
+    let seeds: ComponentSeeds = draw_component_seeds(seed, n_agents);
+
+    let horizon_ns = jget_i64(v, &["horizon_ns"], 0);
+    let mkt_open = DATE_NS + MKT_OPEN_OFFSET;
+    let mkt_close = mkt_open + horizon_ns;
+    let stop_time = mkt_close + 1_000_000_000; // + str_to_ns("1s")
+    let ref_price = jget_i64(v, &["oracle_config", "params", "initial_price"], 100_000);
+
+    // --- oracle (per config.py mappings) ---
+    let kappa_s = jget_f64(v, &["oracle_config", "params", "kappa"], 0.0);
+    let kappa = if kappa_s > 0.0 { kappa_s / 1e9 } else { 1.67e-16 };
+    let jump_s = jget_f64(v, &["oracle_config", "params", "jump_intensity"], 0.0);
+    let megashock_lambda_a = if jump_s > 0.0 { jump_s / 1e9 } else { 2.77778e-18 };
+    let megashock_mean = { let m = jget_f64(v, &["oracle_config","params","jump_sigma"], 0.0); if m != 0.0 { m } else { 1000.0 } };
+    let scheduled_jumps = {
+        let sj = v.get("oracle_config").and_then(|o| o.get("params")).and_then(|p| p.get("scheduled_jump"));
+        match sj {
+            Some(j) if j.is_object() => vec![ScheduledJump {
+                time_ns: mkt_open + j.get("time_ns").and_then(|n| n.as_i64()).unwrap_or(0),
+                magnitude: j.get("magnitude").and_then(|n| n.as_i64()).unwrap_or(0),
+                consumed: false,
+            }],
+            _ => Vec::new(),
+        }
+    };
+    let sym = SymbolParams {
+        r_bar: ref_price as f64,
+        kappa,
+        fund_vol: jget_f64(v, &["oracle_config","params","sigma"], 5e-5),
+        megashock_lambda_a,
+        megashock_mean,
+        megashock_var: 50_000.0,
+        scheduled_jumps,
+    };
+    // draw order: oracle rng first, uses GLOBAL for first megashock interval.
+    let mut global = MT19937::new(seed);
+    // advance global past the per-component randint draws already consumed conceptually by
+    // draw_component_seeds — but config.py draws component seeds from the SAME global stream
+    // THEN the oracle's __init__ draws its first-megashock exponential from global AFTER all
+    // _draw_random_state calls. So re-seed a fresh global and replay the component-seed draws:
+    for _ in 0..(2 + n_agents + 2) { let _ = global.randint_u32(); } // oracle,exchange,agents,latency,kernel
+    let oracle = Oracle::new(mkt_open, sym, MT19937::new(seeds.oracle as u64), &mut global);
+
+    // --- latency model ---
+    let (lat_kind, lmean, lsigma, lmin, lmax, lalpha) = {
+        let lc = v.get("latency_config");
+        match lc {
+            Some(c) => {
+                let model = c.get("model").and_then(|m| m.as_str()).unwrap_or("deterministic");
+                let p = c.get("params");
+                let g = |k: &str, d: f64| p.and_then(|pp| pp.get(k)).and_then(|n| n.as_f64()).unwrap_or(d);
+                let kind = match model {
+                    "log_normal" => LatencyKind::LogNormal,
+                    "uniform" => LatencyKind::Uniform,
+                    "pareto" => LatencyKind::Pareto,
+                    _ => LatencyKind::Deterministic,
+                };
+                (kind, g("mean_ns", 0.0), g("sigma", 0.0), g("min_ns", 0.0), g("max_ns", 1e12), g("alpha", 1.5))
+            }
+            None => (LatencyKind::Deterministic, 0.0, 0.0, 0.0, 1e12, 1.5),
+        }
+    };
+    let latency = ScenarioLatencyModel::new(
+        lat_kind, lmean, lsigma, lmin, lmax, lalpha, MT19937::new(seeds.latency as u64));
+
+    // --- agents (construction order == id order 1..N; exchange is id 0) ---
+    let mut agents: Vec<SimAgent> = Vec::with_capacity(n_agents);
+    let mut next_id: i64 = 1;
+    let mut agent_seed_i = 0usize;
+    for cfg in agent_cfgs {
+        let atype = cfg.get("agent_type").and_then(|t| t.as_str()).unwrap_or("");
+        let count = cfg.get("count").and_then(|n| n.as_i64()).unwrap_or(1);
+        let p = cfg.get("params");
+        let gi = |k: &str, d: i64| p.and_then(|pp| pp.get(k)).and_then(|n| n.as_i64()).unwrap_or(d);
+        let gf = |k: &str, d: f64| p.and_then(|pp| pp.get(k)).and_then(|n| n.as_f64()).unwrap_or(d);
+        let interval_ns = if let Some(iv) = p.and_then(|pp| pp.get("rebalance_interval_ns")).and_then(|n| n.as_i64()) {
+            iv
+        } else {
+            let hz = gf("arrival_rate_hz", 1.0);
+            if hz > 0.0 { (1e9 / hz) as i64 } else { 1_000_000_000 }
+        };
+        for _ in 0..count {
+            let rng = MT19937::new(seeds.agents[agent_seed_i] as u64);
+            agent_seed_i += 1;
+            let kind = match atype {
+                "NoiseTrader" => AgentKind::Noise(NoiseTrader {
+                    order_size_mean: gf("order_size_mean", 10.0),
+                    order_size_std: gf("order_size_std", 2.0),
+                    price_offset_ticks: gi("price_offset_ticks", 5),
+                    reference_price: ref_price,
+                }),
+                "MarketMaker" => AgentKind::Market(MarketMaker {
+                    spread_ticks: gi("spread_ticks", 2).max(2),
+                    depth_levels: gi("depth_levels", 3).max(1),
+                    size_per_level: gi("size_per_level", 10).max(1),
+                    reference_price: ref_price,
+                }),
+                "ValueTrader" => AgentKind::Value(ValueTrader {
+                    order_size_mean: gf("order_size_mean", 25.0),
+                    threshold_ticks: gi("threshold_ticks", 2),
+                    sigma_n: gf("sigma_n", 1000.0),
+                }),
+                "MomentumTrader" => AgentKind::Momentum(MomentumTrader {
+                    order_size_mean: gf("order_size_mean", 15.0),
+                    threshold_ticks: gi("threshold_ticks", 2),
+                    lookback: gi("lookback", 5).max(1) as usize,
+                    mid_history: Vec::new(),
+                }),
+                other => return Err(format!("unsupported agent_type: {other}")),
+            };
+            agents.push(SimAgent { id: next_id, kind, rng, interval_ns: interval_ns.max(1), mkt_open, mkt_close });
+            next_id += 1;
+        }
+    }
+
+    let default_computation_delay = 50;
+    Ok(Sim::new(seeds, n_agents, mkt_open, mkt_close, stop_time, default_computation_delay, latency, oracle, agents))
+}
