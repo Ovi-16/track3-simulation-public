@@ -10,6 +10,33 @@
 
 use pyo3::prelude::*;
 
+use crate::np_random::MT19937;
+
+/// Per-component RNG seeds, drawn from the GLOBAL MT19937 in config.py's exact order:
+/// global.seed(scenario_seed) then one randint_u32() each for oracle, exchange, every
+/// agent (construction order), latency, kernel (Guardrail #4). Reproducing this order
+/// bit-for-bit is prerequisite to every downstream draw matching.
+pub struct ComponentSeeds {
+    pub oracle: u32,
+    pub exchange: u32,
+    pub agents: Vec<u32>,
+    pub latency: u32,
+    pub kernel: u32,
+}
+
+/// Draw the per-component seeds for `n_agents` scenario agents (excludes the exchange,
+/// which is agent id 0 and gets its own seed before the scenario agents).
+pub fn draw_component_seeds(scenario_seed: u64, n_agents: usize) -> ComponentSeeds {
+    let mut g = MT19937::new(scenario_seed);
+    let oracle = g.randint_u32();
+    let exchange = g.randint_u32();
+    let agents = (0..n_agents).map(|_| g.randint_u32()).collect();
+    let latency = g.randint_u32();
+    let kernel = g.randint_u32();
+    ComponentSeeds { oracle, exchange, agents, latency, kernel }
+}
+
+
 /// The compiled simulation engine. Construction wires config -> components with the
 /// exact RNG seeding order (oracle, exchange, agents 1..N, latency, kernel); `run`
 /// drives the kernel loop and returns the trace columns. Not yet wired.
@@ -32,5 +59,23 @@ impl Engine {
             "track3_core Engine.run: dispatch/trace wiring in progress (SPEC-04); \
              use the Python baseline engine until equivalence_harness.py is bit-exact",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_seeds_match_python_config_order_seed42() {
+        // golden from config _draw_random_state() order, seed 42 (2 agents):
+        // oracle 1608637542, exchange 3421126067, agent1 4083286876,
+        // agent2 787846414, latency 3143890026, kernel 3348747335
+        let s = draw_component_seeds(42, 2);
+        assert_eq!(s.oracle, 1_608_637_542);
+        assert_eq!(s.exchange, 3_421_126_067);
+        assert_eq!(s.agents, vec![4_083_286_876, 787_846_414]);
+        assert_eq!(s.latency, 3_143_890_026);
+        assert_eq!(s.kernel, 3_348_747_335);
     }
 }
