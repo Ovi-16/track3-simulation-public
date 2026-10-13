@@ -44,6 +44,10 @@ pub struct Sim {
     pub agents: Vec<SimAgent>,
     pub exchange_id: i64,
     pub current_time: i64,
+    // Half 2:
+    pub next_order_id: i64,
+    pub pending_order_ids: Vec<i64>,
+    pub trace: TraceBuilder,
 }
 
 impl Sim {
@@ -76,7 +80,9 @@ impl Sim {
             agents,
             exchange_id: 0,
             current_time: mkt_open,
-            // mkt_close retained via kernel.stop_time / agents' own copy
+            next_order_id: 0,
+            pending_order_ids: Vec::new(),
+            trace: TraceBuilder::new(),
         }
     }
 
@@ -116,6 +122,131 @@ impl Sim {
         );
     }
 }
+
+// ---- Half 2: order flow (act -> submit -> match -> notify + trace) ----
+
+use crate::agents::OrderIntent;
+use crate::order_book::{IncomingOrder, Side};
+use crate::trace::{msg_type, TraceBuilder, TraceRow, TraceSide};
+
+impl Sim {
+    fn next_order_id(&mut self) -> i64 {
+        let id = self.next_order_id;
+        self.next_order_id += 1;
+        id
+    }
+
+    /// SpreadResponse delivered to an agent: run its act() decision (Half-2) and submit
+    /// the resulting order(s) to the exchange. Deterministic agents (MM/Momentum) take no
+    /// RNG; Noise/Value draw from their own rng in the exact order (L3).
+    pub fn on_spread_response(&mut self, agent_idx: usize, bid: i64, ask: i64) {
+        let t = Touch { bid, ask };
+        let agent_id = self.agents[agent_idx].id;
+        let intents: Vec<OrderIntent> = {
+            let agent = &mut self.agents[agent_idx];
+            match &mut agent.kind {
+                AgentKind::Noise(nt) => vec![nt.act(t, &mut agent.rng)],
+                AgentKind::Market(mm) => mm.act(t),
+                AgentKind::Value(_vt) => {
+                    // ValueTrader needs an oracle observation (one normal from its own rng);
+                    // the oracle advance + observe is wired with the oracle's own stream.
+                    // Deferred: observe_price interaction — flagged for harness debug (Half-3).
+                    Vec::new()
+                }
+                AgentKind::Momentum(mt) => mt.act(t).into_iter().collect(),
+            }
+        };
+        for intent in intents {
+            let oid = self.next_order_id();
+            self.kernel.send_message(
+                agent_id,
+                self.exchange_id,
+                MsgKind::OrderSubmit {
+                    side_is_bid: intent.side == Side::Bid,
+                    size: intent.size,
+                    price: intent.price,
+                },
+                0,
+            );
+            // stash the order_id with the pending submit via a side map keyed by send order
+            self.pending_order_ids.push(oid);
+        }
+    }
+
+    /// Exchange handling of OrderSubmit: run the matching engine, emit trace rows for
+    /// each fill (ORDER_FILLED/PARTIAL_FILL) and the resting remainder (ORDER_ACCEPTED),
+    /// plus a QUOTE_UPDATE on book change. Notifications go back to the agents.
+    pub fn on_order_submit(&mut self, submitter_id: i64, side_is_bid: bool, size: i64, price: i64) {
+        let order_id = self.pending_order_ids.remove(0);
+        let t_ns = self.kernel.current_time;
+        let side = if side_is_bid { Side::Bid } else { Side::Ask };
+        // ORDER_SUBMITTED trace row
+        self.trace.push(TraceRow {
+            t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_SUBMITTED,
+            side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
+            price, size, order_id,
+        });
+        let incoming = IncomingOrder {
+            order_id, agent_id: submitter_id, side, quantity: size,
+            limit_price: price, tick_ns: t_ns, is_ptc: false, mr_preprocess: false,
+        };
+        let result = self.book.handle_limit_order(incoming);
+        for fill in &result.fills {
+            let mt = if fill.quantity == size { msg_type::ORDER_FILLED } else { msg_type::PARTIAL_FILL };
+            self.trace.push(TraceRow {
+                t_ns, agent_id: submitter_id as i32, msg_type: mt,
+                side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
+                price: fill.fill_price, size: fill.quantity, order_id,
+            });
+            // notify both parties (OrderExecuted)
+            self.kernel.send_message(self.exchange_id, fill.resting_agent_id,
+                MsgKind::OrderExecuted { order_id: fill.resting_order_id, qty: fill.quantity, price: fill.fill_price }, 0);
+            self.kernel.send_message(self.exchange_id, submitter_id,
+                MsgKind::OrderExecuted { order_id, qty: fill.quantity, price: fill.fill_price }, 0);
+        }
+        if result.accepted_remainder {
+            self.trace.push(TraceRow {
+                t_ns, agent_id: submitter_id as i32, msg_type: msg_type::ORDER_ACCEPTED,
+                side: if side_is_bid { TraceSide::Bid } else { TraceSide::Ask },
+                price, size, order_id,
+            });
+            self.kernel.send_message(self.exchange_id, submitter_id, MsgKind::OrderAccepted { order_id }, 0);
+        }
+        // QUOTE_UPDATE on book change
+        let t = self.touch();
+        self.trace.push(TraceRow {
+            t_ns, agent_id: self.exchange_id as i32, msg_type: msg_type::QUOTE_UPDATE,
+            side: TraceSide::None, price: t.bid, size: 0, order_id: 0,
+        });
+    }
+
+    /// Drive the event loop to completion, dispatching each event by kind.
+    pub fn run_to_completion(&mut self) {
+        self.prime_wakeups();
+        while let Some(ev) = self.kernel.next_event() {
+            let recipient = ev.recipient_id;
+            match ev.kind {
+                MsgKind::Wakeup => {
+                    if recipient != self.exchange_id {
+                        let idx = (recipient - 1) as usize; // agents are ids 1..N
+                        self.on_wakeup(idx);
+                    }
+                }
+                MsgKind::QuerySpread => self.on_query_spread(ev.sender_id),
+                MsgKind::SpreadResponse { bid, ask } => {
+                    let idx = (recipient - 1) as usize;
+                    self.on_spread_response(idx, bid, ask);
+                }
+                MsgKind::OrderSubmit { side_is_bid, size, price } => {
+                    self.on_order_submit(ev.sender_id, side_is_bid, size, price);
+                }
+                _ => {} // OrderExecuted/Accepted/Cancelled/QuoteUpdate: agent-side bookkeeping (Half-3)
+            }
+            self.kernel.finish_processing(recipient);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
